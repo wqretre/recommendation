@@ -1,18 +1,11 @@
 """Minimal recommendation service (stand-in for the OTel demo's Python service).
 
-Clean baseline revision (bounded recent-id cache). Two things matter here:
-
-1. **It is a real, runnable service.** `python recommendation_server.py` starts an
-   HTTP server on :8080 AND a background load thread that keeps calling
-   `get_recommendations`. So when this image runs in a container, its working-set
-   memory climbs monotonically on its own — 故障诊断处置 Agent can OBSERVE a live leaking
-   process (`docker stats`, the /metrics endpoint), not merely infer it from text.
-
-2. **The leak lives in pure logic that pytest can pin down.** `get_recommendations`
-   appends every requested id into a module-level unbounded list that is never
-   trimmed, so the working set grows without limit -> OOM. The fix is to bound it
-   (collections.deque(maxlen=N)) or drop the cache. `test_memory_is_bounded` is the
-   build+test gate 代码修复 Agent must turn green before opening a PR.
+This is the `feature/dedupe` branch: bounded recent-id cache (no memory leak
+— that bug only exists on `master`), plus a dedupe feature under active
+development (not yet merged): candidates now come from two sources (catalog
+match + merchandising-curated trending) that may overlap, with a planted bug
+in `dedupe.py`: the membership key is normalized with `.lower()` but the
+stored key isn't, so duplicates always slip through.
 
 Kept dependency-light (stdlib only, no gRPC/framework) so 代码修复 Agent can build+test it
 with just the stdlib + pytest in the clone, and so the container image stays tiny.
@@ -26,12 +19,14 @@ from collections import deque
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# --- BAD (s4 planted leak): module-level unbounded accumulation ---
-# Every GetRecommendations call appends to this list and it is never bounded,
-# so the working set grows without limit under sustained load -> OOM.
+import dedupe
+
 _seen_product_ids: deque[str] = deque(maxlen=128)  # bounded: recent ids only
 
 CATALOG = [f"PRODUCT-{i}" for i in range(20)]
+
+# merchandising-curated trending ids, may overlap with the catalog match set
+_TRENDING = ["PRODUCT-0", "PRODUCT-3", "PRODUCT-7"]
 
 # request counter, exposed via /metrics so the climb is observable externally too
 _request_count = 0
@@ -41,11 +36,11 @@ def get_recommendations(input_product_ids: list[str], max_results: int = 5) -> l
     """Return up to max_results recommended product ids not already in the input."""
     global _request_count
     _request_count += 1
-    # leak: record every id we have ever seen, unbounded
     _seen_product_ids.extend(input_product_ids)
 
-    candidates = [p for p in CATALOG if p not in set(input_product_ids)]
-    return candidates[:max_results]
+    catalog_candidates = [p for p in CATALOG if p not in set(input_product_ids)]
+    combined = dedupe.dedupe_ids(catalog_candidates + _TRENDING)
+    return combined[:max_results]
 
 
 def seen_count() -> int:
@@ -67,7 +62,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/metrics"):
             # Prometheus text-exposition: the two signals 故障诊断处置 Agent can scrape.
             body = (
-                "# HELP recommendation_seen_ids_total tracked product ids (unbounded leak)\n"
+                "# HELP recommendation_seen_ids_total tracked product ids\n"
                 "# TYPE recommendation_seen_ids_total gauge\n"
                 f"recommendation_seen_ids_total {seen_count()}\n"
                 "# HELP recommendation_requests_total requests served\n"
@@ -118,7 +113,7 @@ def main() -> None:
         t.start()
         print(f"[recommendation] background load started ~{rps} rps", flush=True)
     srv = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
-    print(f"[recommendation] serving on :{port} (leak revision)", flush=True)
+    print(f"[recommendation] serving on :{port}", flush=True)
     srv.serve_forever()
 
 

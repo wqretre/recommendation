@@ -5,7 +5,7 @@
 FROM python:3.11-slim
 
 WORKDIR /app
-COPY recommendation_server.py /app/
+COPY recommendation_server.py dedupe.py /app/
 
 ENV PORT=8080 \
     LOAD_RPS=200 \
