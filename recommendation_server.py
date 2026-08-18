@@ -1,18 +1,16 @@
 """Minimal recommendation service (stand-in for the OTel demo's Python service).
 
-Clean baseline revision (bounded recent-id cache). Two things matter here:
+This is the `feature/personalization` branch: bounded recent-id cache (no
+memory leak — that bug only exists on `master`), plus three independent
+personalization features under active development, each with its own
+planted bug:
 
-1. **It is a real, runnable service.** `python recommendation_server.py` starts an
-   HTTP server on :8080 AND a background load thread that keeps calling
-   `get_recommendations`. So when this image runs in a container, its working-set
-   memory climbs monotonically on its own — 故障诊断处置 Agent can OBSERVE a live leaking
-   process (`docker stats`, the /metrics endpoint), not merely infer it from text.
-
-2. **The leak lives in pure logic that pytest can pin down.** `get_recommendations`
-   appends every requested id into a module-level unbounded list that is never
-   trimmed, so the working set grows without limit -> OOM. The fix is to bound it
-   (collections.deque(maxlen=N)) or drop the cache. `test_memory_is_bounded` is the
-   build+test gate 代码修复 Agent must turn green before opening a PR.
+1. `ranking.py` — order candidates by popularity score (bug: ascending
+   instead of descending).
+2. `dedupe.py` — drop duplicate candidate ids before returning a response
+   (bug: normalization mismatch lets duplicates through).
+3. `stats.py` — per-category hit counters (bug: unsynchronized
+   read-modify-write races under concurrent requests).
 
 Kept dependency-light (stdlib only, no gRPC/framework) so 代码修复 Agent can build+test it
 with just the stdlib + pytest in the clone, and so the container image stays tiny.
@@ -26,12 +24,16 @@ from collections import deque
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# --- BAD (s4 planted leak): module-level unbounded accumulation ---
-# Every GetRecommendations call appends to this list and it is never bounded,
-# so the working set grows without limit under sustained load -> OOM.
+import dedupe
+import ranking
+import stats
+
 _seen_product_ids: deque[str] = deque(maxlen=128)  # bounded: recent ids only
 
 CATALOG = [f"PRODUCT-{i}" for i in range(20)]
+
+# merchandising-curated trending ids, may overlap with the catalog match set
+_TRENDING = ["PRODUCT-0", "PRODUCT-3", "PRODUCT-7"]
 
 # request counter, exposed via /metrics so the climb is observable externally too
 _request_count = 0
@@ -41,11 +43,14 @@ def get_recommendations(input_product_ids: list[str], max_results: int = 5) -> l
     """Return up to max_results recommended product ids not already in the input."""
     global _request_count
     _request_count += 1
-    # leak: record every id we have ever seen, unbounded
     _seen_product_ids.extend(input_product_ids)
+    stats.record_hit("catalog")
 
-    candidates = [p for p in CATALOG if p not in set(input_product_ids)]
-    return candidates[:max_results]
+    catalog_candidates = [p for p in CATALOG if p not in set(input_product_ids)]
+    combined = dedupe.dedupe_ids(catalog_candidates + _TRENDING)
+    scored = [(p, float(len(CATALOG) - CATALOG.index(p))) for p in combined if p in CATALOG]
+    ranked = ranking.rank_by_score(scored)
+    return ranked[:max_results]
 
 
 def seen_count() -> int:
