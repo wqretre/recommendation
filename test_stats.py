@@ -16,8 +16,11 @@ def test_record_hit_is_thread_safe():
     # interleaves within this short test, instead of relying on scheduling luck.
     old_interval = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)
-    threads_n = 50
-    increments_per_thread = 200
+    # 50x200 was too little work to interleave reliably — it passed against the
+    # racy implementation on every run. 16x50000 loses ~65-75% of the increments
+    # without a lock, so this genuinely fails before the fix and passes after.
+    threads_n = 16
+    increments_per_thread = 50000
     expected_total = threads_n * increments_per_thread
 
     def worker():
@@ -25,11 +28,13 @@ def test_record_hit_is_thread_safe():
             stats.record_hit("electronics")
 
     threads = [threading.Thread(target=worker) for _ in range(threads_n)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    sys.setswitchinterval(old_interval)
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(old_interval)
 
     assert stats.hit_count("electronics") == expected_total, (
         f"lost increments under concurrent load: expected {expected_total}, "
