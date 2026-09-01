@@ -4,8 +4,8 @@ Two things matter here:
 
 1. **It is a real, runnable service.** `python recommendation_server.py` starts an
    HTTP server on :8080 AND a background load thread that keeps calling
-   `get_recommendations`. So when this image runs in a container, its working-set
-   working set stays flat on its own — it can be observed live via `docker stats`
+   `get_recommendations`. So when this image runs in a container, its working set
+   stays flat on its own — it can be observed live via `docker stats`
    and the /metrics endpoint, not merely inferred from text.
 
 2. **The recent-id cache is bounded.** `get_recommendations` records requested ids
