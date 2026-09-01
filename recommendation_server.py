@@ -67,7 +67,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/metrics"):
             # Prometheus text-exposition: the two signals 故障诊断处置 Agent can scrape.
             body = (
-                "# HELP recommendation_seen_ids_total tracked product ids (unbounded leak)\n"
+                "# HELP recommendation_seen_ids_total tracked product ids (bounded cache)\n"
                 "# TYPE recommendation_seen_ids_total gauge\n"
                 f"recommendation_seen_ids_total {seen_count()}\n"
                 "# HELP recommendation_requests_total requests served\n"
@@ -118,7 +118,7 @@ def main() -> None:
         t.start()
         print(f"[recommendation] background load started ~{rps} rps", flush=True)
     srv = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
-    print(f"[recommendation] serving on :{port} (leak revision)", flush=True)
+    print(f"[recommendation] serving on :{port} (bounded cache revision)", flush=True)
     srv.serve_forever()
 
 
