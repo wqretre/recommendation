@@ -1,18 +1,17 @@
 """Minimal recommendation service (stand-in for the OTel demo's Python service).
 
-s4 capstone — the "bad" (planted) revision. Two things matter here:
+Two things matter here:
 
 1. **It is a real, runnable service.** `python recommendation_server.py` starts an
    HTTP server on :8080 AND a background load thread that keeps calling
    `get_recommendations`. So when this image runs in a container, its working-set
-   memory climbs monotonically on its own — 故障诊断处置 Agent can OBSERVE a live leaking
-   process (`docker stats`, the /metrics endpoint), not merely infer it from text.
+   working set stays flat on its own — it can be observed live via `docker stats`
+   and the /metrics endpoint, not merely inferred from text.
 
-2. **The leak lives in pure logic that pytest can pin down.** `get_recommendations`
-   appends every requested id into a module-level unbounded list that is never
-   trimmed, so the working set grows without limit -> OOM. The fix is to bound it
-   (collections.deque(maxlen=N)) or drop the cache. `test_memory_is_bounded` is the
-   build+test gate 代码修复 Agent must turn green before opening a PR.
+2. **The recent-id cache is bounded.** `get_recommendations` records requested ids
+   into a module-level `deque(maxlen=_SEEN_IDS_MAXLEN)`, so the tracking structure
+   cannot grow without limit under sustained load. `test_memory_is_bounded` pins
+   this down.
 
 Kept dependency-light (stdlib only, no gRPC/framework) so 代码修复 Agent can build+test it
 with just the stdlib + pytest in the clone, and so the container image stays tiny.
@@ -23,12 +22,14 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# --- BAD (s4 planted leak): module-level unbounded accumulation ---
-# Every GetRecommendations call appends to this list and it is never bounded,
-# so the working set grows without limit under sustained load -> OOM.
-_seen_product_ids: list[str] = []
+# Bounded recent-id cache: only the most recent ids are kept, so the working set
+# stays flat under sustained load. Must never be replaced by an unbounded
+# container (that was the f18f452 regression -> monotonic RSS growth -> OOM).
+_SEEN_IDS_MAXLEN = 128
+_seen_product_ids: deque[str] = deque(maxlen=_SEEN_IDS_MAXLEN)
 
 CATALOG = [f"PRODUCT-{i}" for i in range(20)]
 
@@ -40,7 +41,7 @@ def get_recommendations(input_product_ids: list[str], max_results: int = 5) -> l
     """Return up to max_results recommended product ids not already in the input."""
     global _request_count
     _request_count += 1
-    # leak: record every id we have ever seen, unbounded
+    # record recently seen ids; bounded by the deque's maxlen
     _seen_product_ids.extend(input_product_ids)
 
     candidates = [p for p in CATALOG if p not in set(input_product_ids)]
@@ -54,8 +55,8 @@ def seen_count() -> int:
 
 # --------------------------------------------------------------------------
 # Runnable service: HTTP endpoints + a self-driving background load thread.
-# This is what makes the leak a LIVE, observable runtime fault rather than a
-# static code smell. Imported as a module (by pytest) none of this runs.
+# This keeps the memory behaviour observable at runtime rather than only in
+# tests. Imported as a module (by pytest) none of this runs.
 # --------------------------------------------------------------------------
 
 class _Handler(BaseHTTPRequestHandler):
@@ -66,7 +67,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/metrics"):
             # Prometheus text-exposition: the two signals 故障诊断处置 Agent can scrape.
             body = (
-                "# HELP recommendation_seen_ids_total tracked product ids (unbounded leak)\n"
+                "# HELP recommendation_seen_ids_total tracked product ids (bounded cache)\n"
                 "# TYPE recommendation_seen_ids_total gauge\n"
                 f"recommendation_seen_ids_total {seen_count()}\n"
                 "# HELP recommendation_requests_total requests served\n"
@@ -94,14 +95,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _background_load(rps: float) -> None:
-    """Continuously exercise the service so memory climbs on its own (no external
-    load generator needed). Each tick grows _seen_product_ids -> monotonic RSS rise.
-
-    The synthetic session ids carry a payload so the leak is visible as real RSS
-    growth in `docker stats` within a couple of minutes, not just an item count."""
+    """Continuously exercise the service (no external load generator needed).
+    Each tick pushes ids through the bounded _seen_product_ids cache, so RSS in
+    `docker stats` should stay flat instead of climbing."""
     i = 0
     interval = 1.0 / rps if rps > 0 else 0.01
-    pad = "x" * 256  # make each leaked entry weigh enough to move RSS
+    pad = "x" * 256  # non-trivial payload per entry, as in real traffic
     while True:
         # batch several ids per tick to make the climb clearly visible in minutes
         get_recommendations([f"PRODUCT-{i % 20}", f"SKU-{i}", f"SESSION-{i}-{pad}"])
@@ -117,7 +116,7 @@ def main() -> None:
         t.start()
         print(f"[recommendation] background load started ~{rps} rps", flush=True)
     srv = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
-    print(f"[recommendation] serving on :{port} (leak revision)", flush=True)
+    print(f"[recommendation] serving on :{port}", flush=True)
     srv.serve_forever()
 
 
